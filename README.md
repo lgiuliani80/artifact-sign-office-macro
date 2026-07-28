@@ -23,6 +23,8 @@ Microsoft's Office SIPs (`msosip.dll` / `msosipx.dll`) cannot be used with `sign
 
 The Office SIP DLLs must be registered on the system. These are located in the `x86/` and `x64/` folders:
 
+*The code has been tested with 32 version ONLY, but it should work with both*.
+
 **For 32-bit Office:**
 ```cmd
 cd x86\
@@ -101,13 +103,13 @@ Create a `metadata.json` file with your Azure Trusted Signing configuration:
 
 ### Examples
 
-**Basic signing with default settings:**
+**Basic signing with default settings:**  
 cmd:
 ```cmd
 OfficeVbaSigner "C:\Macros\report.xlsm" --metadata "C:\Config\metadata.json" --timestamp http://timestamp.acs.microsoft.com
 ```
 
-**Clear existing signatures and re-sign with verbose output:**
+**Clear existing signatures and re-sign with verbose output:**  
 cmd:
 ```cmd
 OfficeVbaSigner "C:\Macros\report.xlsm" ^
