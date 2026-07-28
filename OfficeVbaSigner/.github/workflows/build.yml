@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish
+        run: dotnet publish OfficeVbaSigner/OfficeVbaSigner.csproj -c Release -r win-x86 --self-contained -o publish
+
+      - name: Copy OfficeSIP native DLLs
+        run: |
+          Copy-Item x86/msosip.dll publish/
+          Copy-Item x86/msosipx.dll publish/
+          Copy-Item x86/vbe7.dll publish/
+          Copy-Item OfficeVbaSigner/Register-SIP.cmd publish/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfficeVbaSigner-win-x86
+          path: publish/

@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.Marshalling;
 
 namespace OfficeVbaSigner;
 
@@ -66,46 +65,6 @@ internal static partial class NativeMethods
         public IntPtr pClientData;     // 0x4C
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  SIP_INDIRECT_DATA field offsets (x86)
-    // ═══════════════════════════════════════════════════════════════════
-
-    // SIP_INDIRECT_DATA layout:
-    // 0x00  Data.pszObjId           (IntPtr)
-    // 0x04  Data.Value.cbData       (uint)
-    // 0x08  Data.Value.pbData       (IntPtr)
-    // 0x0C  DigestAlgorithm.pszObjId(IntPtr)
-    // 0x10  DigestAlgorithm.Params.cb (uint)
-    // 0x14  DigestAlgorithm.Params.pb (IntPtr)
-    // 0x18  Digest.cbData           (uint)
-    // 0x1C  Digest.pbData           (IntPtr)
-    // Total: 0x20 = 32 bytes header
-
-    public static IndirectDataFields ReadIndirectData(IntPtr ptr)
-    {
-        var f = new IndirectDataFields();
-        f.DataOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(ptr, 0x00))!;
-
-        uint cbVal = (uint)Marshal.ReadInt32(ptr, 0x04);
-        IntPtr pbVal = Marshal.ReadIntPtr(ptr, 0x08);
-        f.DataValue = new byte[cbVal];
-        if (cbVal > 0) Marshal.Copy(pbVal, f.DataValue, 0, (int)cbVal);
-
-        f.DigestAlgOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(ptr, 0x0C))!;
-
-        uint cbParams = (uint)Marshal.ReadInt32(ptr, 0x10);
-        IntPtr pbParams = Marshal.ReadIntPtr(ptr, 0x14);
-        f.DigestAlgParams = new byte[cbParams];
-        if (cbParams > 0) Marshal.Copy(pbParams, f.DigestAlgParams, 0, (int)cbParams);
-
-        uint cbDigest = (uint)Marshal.ReadInt32(ptr, 0x18);
-        IntPtr pbDigest = Marshal.ReadIntPtr(ptr, 0x1C);
-        f.Digest = new byte[cbDigest];
-        if (cbDigest > 0) Marshal.Copy(pbDigest, f.Digest, 0, (int)cbDigest);
-
-        return f;
-    }
-
     public struct IndirectDataFields
     {
         public string DataOid;
@@ -147,29 +106,4 @@ internal static partial class NativeMethods
     public static partial bool CryptSIPRemoveSignedDataMsg(
         ref SIP_SUBJECTINFO pSubjectInfo,
         uint dwIndex);
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  CryptoMsg API for diagnostics
-    // ═══════════════════════════════════════════════════════════════════
-
-    [LibraryImport("crypt32.dll", SetLastError = true)]
-    public static partial IntPtr CryptMsgOpenToDecode(
-        uint dwMsgEncodingType, uint dwFlags, uint dwMsgType,
-        IntPtr hCryptProv, IntPtr pRecipientInfo, IntPtr pStreamInfo);
-
-    [LibraryImport("crypt32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool CryptMsgUpdate(
-        IntPtr hCryptMsg, IntPtr pbData, uint cbData,
-        [MarshalAs(UnmanagedType.Bool)] bool fFinal);
-
-    [LibraryImport("crypt32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool CryptMsgGetParam(
-        IntPtr hCryptMsg, uint dwParamType, uint dwIndex,
-        IntPtr pvData, ref uint pcbData);
-
-    [LibraryImport("crypt32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool CryptMsgClose(IntPtr hCryptMsg);
 }

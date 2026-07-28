@@ -3,3 +3,4 @@ obj
 test_*
 *.sample
 *.log
+last_run.txt

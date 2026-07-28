@@ -22,6 +22,7 @@ Required:
 Options:
   --alg <sha256|sha384|sha512>   Hash algorithm (default: sha256)
   --passes <1|2|3>               Number of signing passes (default: 3 for triple-sign)
+  --timestamp <url>              RFC 3161 timestamp server URL (e.g. http://timestamp.digicert.com)
   --clear                        Remove existing signatures before signing
   --verbose                      Show detailed progress
 
@@ -33,6 +34,13 @@ Example:
 
     static int Main(string[] args)
     {
+        // ── Internal subprocess commands (self-invocation for SIP isolation) ──
+        if (args.Length >= 2 && args[0] == "--sip-hash")
+            return SipHash(args[1]);
+        if (args.Length >= 3 && args[0] == "--sip-put")
+            return SipPut(args[1], args[2]);
+
+        // ── Normal CLI entry point ──
         if (args.Length == 0 || args[0] is "--help" or "-h" or "help" or "/?")
         {
             Console.Write(Usage);
@@ -43,19 +51,20 @@ Example:
         string filePath = args[0];
         string? metadataPath = null;
         string algName = "sha256";
+        string? timestampUrl = null;
         int passes = 3;
-        bool clearFirst = false, verbose = false, testLocal = false;
+        bool clearFirst = false, verbose = false;
 
         for (int i = 1; i < args.Length; i++)
         {
             switch (args[i].ToLowerInvariant())
             {
-                case "--metadata": metadataPath = args[++i]; break;
-                case "--alg":    algName = args[++i].ToLowerInvariant(); break;
-                case "--passes": passes = int.Parse(args[++i]); break;
-                case "--clear":  clearFirst = true; break;
-                case "--verbose": verbose = true; break;
-                case "--test-local": testLocal = true; break;
+                case "--metadata":  metadataPath = args[++i]; break;
+                case "--alg":       algName = args[++i].ToLowerInvariant(); break;
+                case "--timestamp": timestampUrl = args[++i]; break;
+                case "--passes":    passes = int.Parse(args[++i]); break;
+                case "--clear":     clearFirst = true; break;
+                case "--verbose":   verbose = true; break;
             }
         }
 
@@ -66,43 +75,20 @@ Example:
             _ => OID_SHA256
         };
 
-        if (!testLocal && metadataPath is null)
+        if (metadataPath is null)
         {
             Console.Error.WriteLine("Error: --metadata is required.");
             return 1;
         }
 
         if (!File.Exists(filePath))    { Console.Error.WriteLine($"File not found: {filePath}"); return 1; }
-        if (!testLocal && !File.Exists(metadataPath!)){ Console.Error.WriteLine($"Metadata not found: {metadataPath}"); return 1; }
+        if (!File.Exists(metadataPath)){ Console.Error.WriteLine($"Metadata not found: {metadataPath}"); return 1; }
 
         filePath = Path.GetFullPath(filePath);
 
-        if (testLocal)
-        {
-            // Quick test: sign with local self-signed cert to verify SIP interop
-            if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
-            {
-                Console.Error.WriteLine($"No SIP registered for this file type.");
-                return 1;
-            }
-            GCHandle guidHandle = GCHandle.Alloc(sipGuid, GCHandleType.Pinned);
-            IntPtr pAlgOid = Marshal.StringToHGlobalAnsi(digestAlgOid);
-            try
-            {
-                if (clearFirst) ClearSignatures(filePath, guidHandle.AddrOfPinnedObject(), pAlgOid);
-                return TestSignWithLocalCert(filePath, guidHandle.AddrOfPinnedObject(),
-                    pAlgOid, digestAlgOid, verbose) ? 0 : 1;
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(pAlgOid);
-                guidHandle.Free();
-            }
-        }
-
         try
         {
-            return RunSigning(filePath, metadataPath, digestAlgOid, passes, clearFirst, verbose);
+            return RunSigning(filePath, metadataPath, digestAlgOid, passes, clearFirst, verbose, timestampUrl);
         }
         catch (Exception ex)
         {
@@ -113,7 +99,8 @@ Example:
     }
 
     static int RunSigning(string filePath, string metadataPath,
-                           string digestAlgOid, int passes, bool clearFirst, bool verbose)
+                           string digestAlgOid, int passes, bool clearFirst, bool verbose,
+                           string? timestampUrl)
     {
         // ── 1. Determine SIP GUID for this file ────────────────────────
         if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
@@ -149,7 +136,7 @@ Example:
                 Console.WriteLine($"── Signing pass {pass}/{passes} ──");
 
                 bool ok = SignOnePass(filePath, guidHandle.AddrOfPinnedObject(),
-                                     pAlgOid, digestAlgOid, signer, verbose);
+                                     pAlgOid, digestAlgOid, signer, verbose, timestampUrl);
                 if (!ok) return 1;
 
                 Console.WriteLine($"   Pass {pass} completed successfully.");
@@ -166,19 +153,21 @@ Example:
     }
 
     /// <summary>
-    /// Execute a single signing pass (synchronous to maintain COM thread affinity):
-    ///   1. Get indirect data (digest) from the SIP
+    /// Execute a single signing pass:
+    ///   1. Get indirect data (digest) from the SIP via self-subprocess
     ///   2. Encode it as DER → SPC_INDIRECT_DATA
     ///   3. Use .NET SignedCms with a custom RSA wrapper that delegates to Azure
-    ///   4. Embed the PKCS#7 via the SIP
+    ///   4. Embed the PKCS#7 via self-subprocess
+    ///
+    /// SIP operations run in clean child processes (self-invocation with --sip-hash / --sip-put)
+    /// because msosipx.dll uses process-global mutable state that gets corrupted by the Azure SDK.
     /// </summary>
     static bool SignOnePass(string filePath, IntPtr pGuid, IntPtr pAlgOid,
-                            string digestAlgOid, AzureSigner signer, bool verbose)
+                            string digestAlgOid, AzureSigner signer, bool verbose,
+                            string? timestampUrl)
     {
-        // ── Step 1: Get IndirectData hash via subprocess ─────────────────
-        // The SIP uses process-global mutable state that gets corrupted by the Azure SDK.
-        // Solution: run all SIP operations in clean subprocesses.
-        var fields = RunHashSubprocess(filePath, verbose);
+        // ── Step 1: Get IndirectData hash via self-subprocess ────────────
+        var fields = RunSipHashSubprocess(filePath, verbose);
         if (fields == null) return false;
 
         if (verbose)
@@ -194,8 +183,8 @@ Example:
         // ── Step 2: Get certificate from Azure + build SignedCms ────────
         if (verbose) Console.WriteLine("   Fetching signing certificate from Azure...");
 
-        // First do a dummy sign to get the certificate
-        byte[] dummyDigest = new byte[32]; // placeholder
+        // Dummy sign to obtain the certificate (the SDK requires a sign op to return it)
+        byte[] dummyDigest = new byte[32];
         var (_, certBytes) = signer.SignDigestAsync(dummyDigest, digestAlgOid)
             .GetAwaiter().GetResult();
         byte[] certDer = ParseCertificate(certBytes);
@@ -225,16 +214,24 @@ Example:
         if (verbose) Console.WriteLine("   Computing CMS signature via Azure...");
         signedCms.ComputeSignature(cmsSigner);
 
+        // ── Step 2b: Add RFC 3161 timestamp if requested ───────────────
+        if (timestampUrl is not null)
+        {
+            if (verbose) Console.WriteLine($"   Requesting RFC 3161 timestamp from {timestampUrl}...");
+            AddRfc3161Timestamp(signedCms, timestampUrl, digestAlgOid, verbose);
+            if (verbose) Console.WriteLine("   Timestamp added successfully.");
+        }
+
         byte[] pkcs7 = signedCms.Encode();
         if (verbose) Console.WriteLine($"   PKCS#7 size: {pkcs7.Length} bytes");
 
-        // ── Step 3: Embed signature via subprocess ─────────────────────
-        string pkcs7TempPath = Path.Combine(Path.GetTempPath(), $"vbasign_{Guid.NewGuid():N}.p7");
+        // ── Step 3: Embed signature via self-subprocess ─────────────────
+        string pkcs7TempPath = Path.Combine(Path.GetTempPath(), $"test_vbasign_{Guid.NewGuid():N}.p7");
         File.WriteAllBytes(pkcs7TempPath, pkcs7);
         try
         {
             if (verbose) Console.WriteLine($"   Invoking PutSignedDataMsg via subprocess...");
-            bool putOk = RunPutSubprocess(filePath, pkcs7TempPath, verbose);
+            bool putOk = RunSipPutSubprocess(filePath, pkcs7TempPath, verbose);
             if (!putOk) return false;
             if (verbose) Console.WriteLine($"   Signature embedded successfully.");
         }
@@ -272,18 +269,75 @@ Example:
     }
 
     /// <summary>
-    /// Runs CryptSIPCreateIndirectData in a subprocess to get the file hash.
-    /// Returns the IndirectData fields needed to build the PKCS#7.
+    /// Request an RFC 3161 timestamp from a TSA and embed it as an unsigned attribute
+    /// (OID 1.3.6.1.4.1.311.3.3.1) in the first signer info.
     /// </summary>
-    static IndirectDataFields? RunHashSubprocess(string filePath, bool verbose)
+    static void AddRfc3161Timestamp(
+        System.Security.Cryptography.Pkcs.SignedCms signedCms,
+        string tsaUrl,
+        string digestAlgOid,
+        bool verbose)
     {
-        string putTestExe = FindPutTestExe();
-        if (putTestExe == null!) return null;
+        var signerInfo = signedCms.SignerInfos[0];
+
+        // Map digest OID to HashAlgorithmName
+        var hashAlg = digestAlgOid switch
+        {
+            OID_SHA384 => HashAlgorithmName.SHA384,
+            OID_SHA512 => HashAlgorithmName.SHA512,
+            _ => HashAlgorithmName.SHA256
+        };
+
+        // Build the timestamp request from the signer's encrypted digest
+        var tsReq = System.Security.Cryptography.Pkcs.Rfc3161TimestampRequest.CreateFromSignerInfo(
+            signerInfo,
+            hashAlg,
+            requestSignerCertificates: true,
+            nonce: null);
+
+        byte[] reqBytes = tsReq.Encode();
+        if (verbose) Console.WriteLine($"   Timestamp request: {reqBytes.Length} bytes");
+
+        // Send to TSA via HTTP POST
+        using var http = new HttpClient();
+        http.Timeout = TimeSpan.FromSeconds(30);
+        var content = new ByteArrayContent(reqBytes);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/timestamp-query");
+
+        var response = http.Send(new HttpRequestMessage(HttpMethod.Post, tsaUrl) { Content = content });
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException(
+                $"Timestamp server returned HTTP {(int)response.StatusCode}: {response.ReasonPhrase}");
+
+        byte[] tsaRespBytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        if (verbose) Console.WriteLine($"   Timestamp response: {tsaRespBytes.Length} bytes");
+
+        // Process the RFC 3161 response and extract the timestamp token
+        var token = tsReq.ProcessResponse(tsaRespBytes, out int pkiStatus);
+        if (verbose) Console.WriteLine($"   TSA status: {pkiStatus} (0=granted)");
+
+        // Embed as unsigned attribute (szOID_RFC3161_counterSign)
+        byte[] tokenBytes = token.AsSignedCms().Encode();
+        signerInfo.AddUnsignedAttribute(new AsnEncodedData("1.3.6.1.4.1.311.3.3.1", tokenBytes));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Self-subprocess methods: invoke this same executable with internal args
+    //  to isolate SIP operations from the Azure SDK's crypto interference.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Invokes self with --sip-hash to get IndirectData from a clean process.
+    /// </summary>
+    static IndirectDataFields? RunSipHashSubprocess(string filePath, bool verbose)
+    {
+        string self = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Cannot determine own executable path.");
 
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = putTestExe,
-            Arguments = $"\"{filePath}\" --hash",
+            FileName = self,
+            Arguments = $"--sip-hash \"{filePath}\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -297,7 +351,7 @@ Example:
 
         if (proc.ExitCode != 0)
         {
-            Console.Error.WriteLine($"   Hash subprocess failed (exit={proc.ExitCode}):");
+            Console.Error.WriteLine($"   SIP hash subprocess failed (exit={proc.ExitCode}):");
             if (!string.IsNullOrWhiteSpace(stderr))
                 Console.Error.Write($"   {stderr}");
             return null;
@@ -318,7 +372,7 @@ Example:
 
         if (dataOid == null || digestAlg == null || digest == null || dataValue == null)
         {
-            Console.Error.WriteLine("   Hash subprocess returned incomplete data.");
+            Console.Error.WriteLine("   SIP hash subprocess returned incomplete data.");
             return null;
         }
 
@@ -333,19 +387,17 @@ Example:
     }
 
     /// <summary>
-    /// Runs CryptSIPCreateIndirectData + CryptSIPPutSignedDataMsg in a subprocess.
-    /// This avoids the SIP state corruption caused by the Azure SDK's crypto operations.
-    /// Uses PutTest.exe which is a minimal helper that calls these functions in a clean process.
+    /// Invokes self with --sip-put to embed the PKCS#7 in a clean process.
     /// </summary>
-    static bool RunPutSubprocess(string filePath, string pkcs7Path, bool verbose)
+    static bool RunSipPutSubprocess(string filePath, string pkcs7Path, bool verbose)
     {
-        string putTestExe = FindPutTestExe();
-        if (putTestExe == null!) { Console.Error.WriteLine("   PutTest helper not found."); return false; }
+        string self = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Cannot determine own executable path.");
 
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = putTestExe,
-            Arguments = $"\"{filePath}\" \"{pkcs7Path}\"",
+            FileName = self,
+            Arguments = $"--sip-put \"{filePath}\" \"{pkcs7Path}\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -360,12 +412,12 @@ Example:
         if (verbose && !string.IsNullOrWhiteSpace(stdout))
         {
             foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                Console.WriteLine($"   [Put] {line.TrimEnd()}");
+                Console.WriteLine($"   [SIP] {line.TrimEnd()}");
         }
 
         if (proc.ExitCode != 0)
         {
-            Console.Error.WriteLine($"   PutSignedDataMsg subprocess failed (exit={proc.ExitCode}):");
+            Console.Error.WriteLine($"   SIP put subprocess failed (exit={proc.ExitCode}):");
             if (!string.IsNullOrWhiteSpace(stderr))
                 Console.Error.Write($"   {stderr}");
             return false;
@@ -373,179 +425,129 @@ Example:
         return true;
     }
 
-    static string FindPutTestExe()
-    {
-        // Search for PutTest.exe in known locations
-        string[] candidates = [
-            Path.Combine(AppContext.BaseDirectory, "PutTest.exe"),
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PutTest",
-                "bin", "Release", "net10.0-windows", "win-x86", "PutTest.exe")),
-            Path.GetFullPath(Path.Combine(".", "..", "PutTest",
-                "bin", "Release", "net10.0-windows", "win-x86", "PutTest.exe")),
-        ];
-        foreach (var c in candidates)
-            if (File.Exists(c)) return c;
-        Console.Error.WriteLine("   PutTest helper not found. Build PutTest project first.");
-        return null!;
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Internal SIP subprocess entry points (invoked via --sip-hash / --sip-put)
+    //  These run in a CLEAN process without any Azure SDK loaded, avoiding
+    //  corruption of msosipx.dll's process-global mutable state.
+    // ═══════════════════════════════════════════════════════════════════════
 
-    static void PrintPutError(int err)
+    /// <summary>
+    /// Subprocess mode: compute IndirectData and print fields to stdout.
+    /// </summary>
+    static int SipHash(string filePath)
     {
-        switch (unchecked((uint)err))
+        filePath = Path.GetFullPath(filePath);
+        if (!File.Exists(filePath)) { Console.Error.WriteLine($"Not found: {filePath}"); return 1; }
+
+        if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
+        { Console.Error.WriteLine($"No SIP. Error: 0x{Marshal.GetLastWin32Error():X8}"); return 1; }
+
+        var si = BuildSubjectInfo(filePath, sipGuid, out var handles);
+        try
         {
-            case 0x80004003:
-                Console.Error.WriteLine("   → E_POINTER: Invalid parameter (null pointer).");
-                break;
-            case 0x80004002:
-                Console.Error.WriteLine("   → E_NOINTERFACE: SIP interface error.");
-                break;
-            case 0x8007000D:
-                Console.Error.WriteLine("   → ERROR_INVALID_DATA: The PKCS#7 structure is invalid.");
-                break;
-            case 0x800B0106:
-                Console.Error.WriteLine("   → CERT_E_WRONG_USAGE: Certificate lacks Code Signing EKU.");
-                break;
-            case 0x80070005:
-                Console.Error.WriteLine("   → E_ACCESSDENIED: File or signing access denied.");
-                break;
-            case 0x8007000E:
-                Console.Error.WriteLine("   → E_OUTOFMEMORY.");
-                break;
+            uint cb = 0;
+            CryptSIPCreateIndirectData(ref si, ref cb, IntPtr.Zero);
+            IntPtr pBuf = Marshal.AllocHGlobal((int)cb);
+            if (!CryptSIPCreateIndirectData(ref si, ref cb, pBuf))
+            {
+                Console.Error.WriteLine($"CreateIndirectData failed: 0x{Marshal.GetLastWin32Error():X8}");
+                Marshal.FreeHGlobal(pBuf);
+                return 1;
+            }
+
+            // Read SPC_INDIRECT_DATA native struct (x86 layout)
+            string dataOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(pBuf, 0x00))!;
+            uint dataValCb = (uint)Marshal.ReadInt32(pBuf, 0x04);
+            IntPtr dataValPb = Marshal.ReadIntPtr(pBuf, 0x08);
+            string digestAlgOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(pBuf, 0x0C))!;
+            uint digestCb = (uint)Marshal.ReadInt32(pBuf, 0x18);
+            IntPtr digestPb = Marshal.ReadIntPtr(pBuf, 0x1C);
+
+            byte[] dataVal = new byte[dataValCb];
+            if (dataValCb > 0) Marshal.Copy(dataValPb, dataVal, 0, (int)dataValCb);
+            byte[] digest = new byte[digestCb];
+            if (digestCb > 0) Marshal.Copy(digestPb, digest, 0, (int)digestCb);
+
+            Marshal.FreeHGlobal(pBuf);
+
+            Console.WriteLine($"DATA_OID={dataOid}");
+            Console.WriteLine($"DATA_VALUE={Convert.ToHexString(dataVal)}");
+            Console.WriteLine($"DIGEST_ALG={digestAlgOid}");
+            Console.WriteLine($"DIGEST={Convert.ToHexString(digest)}");
+            Console.WriteLine($"SIZE={cb}");
+            return 0;
         }
+        finally { FreeHandles(handles); }
     }
 
     /// <summary>
-    /// TEST: Sign using a local self-signed certificate and .NET's SignedCms,
-    /// to verify that our SIP_SUBJECTINFO struct + P/Invoke are correct.
-    /// If this works, the issue is in our manual PKCS#7 builder.
+    /// Subprocess mode: CreateIndirectData (to open file) then PutSignedDataMsg.
     /// </summary>
-    static bool TestSignWithLocalCert(string filePath, IntPtr pGuid, IntPtr pAlgOid,
-                                      string digestAlgOid, bool verbose)
+    static int SipPut(string filePath, string pkcs7Path)
     {
-        // Test: use the Azure cert embedded in the PKCS#7 but sign with a LOCAL key.
-        // This isolates whether the crash is due to the cert content or the signature.
-        byte[] azureCertDer;
-        string metaFile = Path.Combine(Path.GetDirectoryName(filePath)!, "metadata.json");
-        if (File.Exists(metaFile))
-        {
-            Console.WriteLine("[TEST] Fetching Azure cert to test with local key...");
-            var tempSigner = AzureSigner.FromMetadataFile(metaFile);
-            var (_, cb) = tempSigner.SignDigestAsync(new byte[32], digestAlgOid)
-                .GetAwaiter().GetResult();
-            azureCertDer = ParseCertificate(cb);
-            Console.WriteLine($"[TEST] Azure cert: {azureCertDer.Length} bytes");
-        }
-        else
-        {
-            // Fallback: use a large self-signed cert
-            using var tmpRsa = System.Security.Cryptography.RSA.Create(3072);
-            var tmpReq = new System.Security.Cryptography.X509Certificates.CertificateRequest(
-                "CN=Test", tmpRsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            tmpReq.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension(
-                new System.Security.Cryptography.OidCollection { new Oid("1.3.6.1.5.5.7.3.3") }, false));
-            using var tmpCert = tmpReq.CreateSelfSigned(DateTimeOffset.Now.AddMinutes(-5), DateTimeOffset.Now.AddHours(1));
-            azureCertDer = tmpCert.RawData;
-        }
+        filePath = Path.GetFullPath(filePath);
+        pkcs7Path = Path.GetFullPath(pkcs7Path);
+        if (!File.Exists(filePath)) { Console.Error.WriteLine($"Not found: {filePath}"); return 1; }
+        if (!File.Exists(pkcs7Path)) { Console.Error.WriteLine($"Not found: {pkcs7Path}"); return 1; }
 
-        // Create a local RSA key matching the Azure cert's key size
-        using var azureCertParsed = System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificate(azureCertDer);
-        using var pubKey = System.Security.Cryptography.X509Certificates.RSACertificateExtensions.GetRSAPublicKey(azureCertParsed)!;
-        int keySize = pubKey.KeySize;
-        Console.WriteLine($"[TEST] Azure cert key size: {keySize} bits, Subject: {azureCertParsed.Subject}");
+        byte[] pkcs7 = File.ReadAllBytes(pkcs7Path);
 
-        // Create a self-signed cert with SAME key size (signature won't verify but tests structure)
-        using var localRsa = System.Security.Cryptography.RSA.Create(keySize);
-        var req = new System.Security.Cryptography.X509Certificates.CertificateRequest(
-            azureCertParsed.Subject, localRsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        req.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension(
-            new System.Security.Cryptography.OidCollection { new Oid("1.3.6.1.5.5.7.3.3") }, false));
-        using var localCert = req.CreateSelfSigned(DateTimeOffset.Now.AddMinutes(-5), DateTimeOffset.Now.AddHours(1));
-        Console.WriteLine($"[TEST] Created local cert: {localCert.RawData.Length} bytes");
+        if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
+        { Console.Error.WriteLine($"No SIP. Error: 0x{Marshal.GetLastWin32Error():X8}"); return 1; }
 
-        // Now use CmsSigner with the AZURE CERT but LOCAL RSA key
-        // SignedCms will embed azureCert but sign with localRsa
-        // The signature won't verify, but we test if the SIP crashes due to the cert content
-
-        // ── Step 1: CryptSIPCreateIndirectData ─────────────────────────
-        var si = new SIP_SUBJECTINFO();
-        si.cbSize = 0x50;
-        si.pgSubjectType = pGuid;
-        si.hFile = INVALID_HANDLE_VALUE;
-        si.pwsFileName = Marshal.StringToHGlobalUni(filePath);
-        si.dwEncodingType = ENCODING;
-        si.digestAlgObjId = pAlgOid;
-        si.dwIntVersion = 1;
-
-        IntPtr pIndirectData = IntPtr.Zero;
+        var si = BuildSubjectInfo(filePath, sipGuid, out var handles);
         try
         {
-            uint cbIndirectData = 0;
-            if (!CryptSIPCreateIndirectData(ref si, ref cbIndirectData, IntPtr.Zero))
+            // CreateIndirectData to open the file and set SIP globals
+            uint cb = 0;
+            CryptSIPCreateIndirectData(ref si, ref cb, IntPtr.Zero);
+            IntPtr pBuf = Marshal.AllocHGlobal((int)cb);
+            if (!CryptSIPCreateIndirectData(ref si, ref cb, pBuf))
             {
-                Console.Error.WriteLine($"[TEST] CreateIndirectData size query failed: 0x{Marshal.GetLastWin32Error():X8}");
-                return false;
+                Console.Error.WriteLine($"CreateIndirectData failed: 0x{Marshal.GetLastWin32Error():X8}");
+                Marshal.FreeHGlobal(pBuf);
+                return 1;
             }
+            Marshal.FreeHGlobal(pBuf);
 
-            pIndirectData = Marshal.AllocHGlobal((int)cbIndirectData);
-            if (!CryptSIPCreateIndirectData(ref si, ref cbIndirectData, pIndirectData))
-            {
-                Console.Error.WriteLine($"[TEST] CreateIndirectData fill failed: 0x{Marshal.GetLastWin32Error():X8}");
-                return false;
-            }
-
-            var fields = ReadIndirectData(pIndirectData);
-            Console.WriteLine($"[TEST] IndirectData: OID={fields.DataOid}, Digest={Convert.ToHexString(fields.Digest)}");
-
-            // ── Step 2: Encode SPC_INDIRECT_DATA ──────────────────────────
-            byte[] spcDer = Pkcs7Builder.EncodeSpcIndirectData(fields);
-
-            // ── Step 3: Use .NET SignedCms, sign with localRsa, embed azureCert ─
-            var contentInfo = new System.Security.Cryptography.Pkcs.ContentInfo(
-                new Oid("1.3.6.1.4.1.311.2.1.4"), spcDer);
-            var signedCms = new System.Security.Cryptography.Pkcs.SignedCms(contentInfo, detached: false);
-
-            // CmsSigner with the Azure cert + local RSA (mismatched, but tests cert embedding)
-            var cmsSigner = new System.Security.Cryptography.Pkcs.CmsSigner(
-                System.Security.Cryptography.Pkcs.SubjectIdentifierType.IssuerAndSerialNumber,
-                azureCertParsed, localRsa, RSASignaturePadding.Pkcs1);
-            cmsSigner.DigestAlgorithm = new Oid(digestAlgOid);
-            cmsSigner.IncludeOption = System.Security.Cryptography.X509Certificates.X509IncludeOption.EndCertOnly;
-            signedCms.ComputeSignature(cmsSigner);
-
-            byte[] pkcs7 = signedCms.Encode();
-            Console.WriteLine($"[TEST] SignedCms PKCS#7 (azure cert + local key): {pkcs7.Length} bytes");
-
-            string dumpPath = Path.ChangeExtension(filePath, ".test_pkcs7.der");
-            File.WriteAllBytes(dumpPath, pkcs7);
-            Console.WriteLine($"[TEST] Dumped to: {dumpPath}");
-
-            // ── Step 4: CryptSIPPutSignedDataMsg ───────────────────────────
-            uint dwIndex = 0;
+            // PutSignedDataMsg
             GCHandle pkcs7Pin = GCHandle.Alloc(pkcs7, GCHandleType.Pinned);
-            try
-            {
-                Console.WriteLine("[TEST] Calling CryptSIPPutSignedDataMsg...");
-                if (!CryptSIPPutSignedDataMsg(ref si, ENCODING, ref dwIndex,
-                                              (uint)pkcs7.Length, pkcs7Pin.AddrOfPinnedObject()))
-                {
-                    int err = Marshal.GetLastWin32Error();
-                    Console.Error.WriteLine($"[TEST] PutSignedDataMsg FAILED (no crash!): 0x{err:X8}");
-                    PrintPutError(err);
-                    return false;
-                }
-                Console.WriteLine($"[TEST] PutSignedDataMsg SUCCESS! Index={dwIndex}");
-                return true;
-            }
-            finally
-            {
-                pkcs7Pin.Free();
-            }
+            uint dwIndex = 0;
+            bool result = CryptSIPPutSignedDataMsg(ref si, ENCODING, ref dwIndex,
+                (uint)pkcs7.Length, pkcs7Pin.AddrOfPinnedObject());
+            pkcs7Pin.Free();
+
+            if (result)
+                Console.WriteLine($"OK Index={dwIndex}");
+            else
+                Console.Error.WriteLine($"PutSignedDataMsg failed: 0x{Marshal.GetLastWin32Error():X8}");
+            return result ? 0 : 1;
         }
-        finally
-        {
-            if (pIndirectData != IntPtr.Zero) Marshal.FreeHGlobal(pIndirectData);
-            Marshal.FreeHGlobal(si.pwsFileName);
-        }
+        finally { FreeHandles(handles); }
+    }
+
+    static SIP_SUBJECTINFO BuildSubjectInfo(string filePath, Guid sipGuid, out (GCHandle, IntPtr, IntPtr) handles)
+    {
+        var si = new SIP_SUBJECTINFO();
+        si.cbSize = 0x50;
+        GCHandle guidPin = GCHandle.Alloc(sipGuid, GCHandleType.Pinned);
+        si.pgSubjectType = guidPin.AddrOfPinnedObject();
+        si.hFile = INVALID_HANDLE_VALUE;
+        IntPtr pwsFile = Marshal.StringToHGlobalUni(filePath);
+        si.pwsFileName = pwsFile;
+        si.dwIntVersion = 1;
+        IntPtr pAlg = Marshal.StringToHGlobalAnsi(OID_SHA256);
+        si.digestAlgObjId = pAlg;
+        si.dwEncodingType = ENCODING;
+        handles = (guidPin, pwsFile, pAlg);
+        return si;
+    }
+
+    static void FreeHandles((GCHandle, IntPtr, IntPtr) h)
+    {
+        h.Item1.Free();
+        Marshal.FreeHGlobal(h.Item2);
+        Marshal.FreeHGlobal(h.Item3);
     }
 
     /// <summary>
