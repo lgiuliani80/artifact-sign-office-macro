@@ -46,6 +46,9 @@ Options:
   --verbose                      Show detailed progress
 ```
 
+Authentication leverages `DefaultAzureCredential`, meaning it will probe different authentication mechanisms until a working one is found.  
+`az cli` credentials are the most common source of authentication.
+
 ### Example
 
 ```bat
