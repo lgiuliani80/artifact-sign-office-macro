@@ -1,0 +1,15 @@
+{
+    "Endpoint": "https://weu.codesigning.azure.net/",
+    "CodeSigningAccountName": "artsign-lucagiuliani",
+    "CertificateProfileName": "private-casa",
+    "ExcludeEnvironmentCredential": true,
+    "ExcludeManagedIdentityCredential": true,
+    "ExcludeAzureCliCredential": true,
+    "ExcludeAzurePowerShellCredential": false,
+    "ExcludeVisualStudioCredential": true,
+    "ExcludeVisualStudioCodeCredential": true,
+    "ExcludeSharedTokenCacheCredential": true,
+    "ExcludeInteractiveBrowserCredential": true,
+    "ExcludeAzureDeveloperCliCredential": true,
+    "ExcludeWorkloadIdentityCredential": true
+}
