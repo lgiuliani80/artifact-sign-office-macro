@@ -102,33 +102,20 @@ Create a `metadata.json` file with your Azure Trusted Signing configuration:
 ### Examples
 
 **Basic signing with default settings:**
+cmd:
 ```cmd
-OfficeVbaSigner "C:\Macros\report.xlsm" --metadata "C:\Config\metadata.json"
-```
-
-**Signing with SHA-384 and timestamp:**
-```cmd
-OfficeVbaSigner "C:\Macros\report.xlsm" ^
-  --metadata "C:\Config\metadata.json" ^
-  --alg sha384 ^
-  --timestamp http://timestamp.acs.microsoft.com
+OfficeVbaSigner "C:\Macros\report.xlsm" --metadata "C:\Config\metadata.json" --timestamp http://timestamp.acs.microsoft.com
 ```
 
 **Clear existing signatures and re-sign with verbose output:**
+cmd:
 ```cmd
 OfficeVbaSigner "C:\Macros\report.xlsm" ^
   --metadata "C:\Config\metadata.json" ^
+  --timestamp http://timestamp.acs.microsoft.com ^
   --clear ^
   --verbose
 ```
-
-**Single-pass signing:**
-```cmd
-OfficeVbaSigner "C:\Macros\report.xlsm" ^
-  --metadata "C:\Config\metadata.json" ^
-  --passes 1
-```
-
 ---
 
 ## Project Structure
