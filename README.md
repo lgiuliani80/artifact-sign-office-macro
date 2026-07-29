@@ -23,7 +23,7 @@ Microsoft's Office SIPs (`msosip.dll` / `msosipx.dll`) cannot be used with `sign
 
 The Office SIP DLLs must be registered on the system. These are located in the `x86/` and `x64/` folders:
 
-*The code has been tested with 32 version ONLY, but it should work with both*.
+> The code has been tested with 32 version ONLY, but it should work with both.
 
 **For 32-bit Office:**
 ```cmd
@@ -51,10 +51,11 @@ Register-SIP.cmd
 - **vbe7.dll** — Must be accessible (same directory as SIP DLLs or registered in HKLM registry)
 - **Azure Trusted Signing Account** — Set up an account at https://portal.azure.com
 - **Azure Authentication** — Configure via:
-  - `az login` (Azure CLI) -OR-
-  - Environment variables (`AZURE_SUBSCRIPTION_ID`, etc.) -OR-
+  - `az login` (Azure CLI)
+  - Environment variables (`AZURE_SUBSCRIPTION_ID`, etc.)
   - Managed Identity (if running in Azure)
 - **.NET 10.0 x86 Runtime** — Install from https://dotnet.microsoft.com/download
+- Authentication leverages `DefaultAzureCredential`, meaning it will probe different authentication mechanisms until a working one is found. `az cli` credentials are the most common source of authentication.
 
 ---
 
