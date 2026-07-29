@@ -29,6 +29,10 @@ param(
 )
 
 begin {
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "This script requires PowerShell 7 or later. Current version: $($PSVersionTable.PSVersion). Run with pwsh.exe instead of powershell.exe."
+    }
+
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     Add-Type -AssemblyName System.Security
 
