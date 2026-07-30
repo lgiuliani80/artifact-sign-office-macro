@@ -21,7 +21,7 @@ Required:
 
 Options:
   --alg <sha256|sha384|sha512>   Hash algorithm (default: sha256)
-  --passes <1|2|3>               Number of signing passes (default: 3 for triple-sign)
+    --passes <1>                   Number of signing passes (legacy VBA format)
   --timestamp <url>              RFC 3161 timestamp server URL (e.g. http://timestamp.digicert.com)
   --clear                        Remove existing signatures before signing
   --verbose                      Show detailed progress
@@ -29,16 +29,19 @@ Options:
 Example:
   OfficeVbaSigner ""C:\Files\macros.xlsm"" ^
     --metadata ""C:\Config\metadata.json"" ^
-    --alg sha256 --passes 3 --clear
+    --alg sha256 --passes 1 --clear
 ";
 
     static int Main(string[] args)
     {
         // ── Internal subprocess commands (self-invocation for SIP isolation) ──
-        if (args.Length >= 2 && args[0] == "--sip-hash")
-            return SipHash(args[1]);
-        if (args.Length >= 3 && args[0] == "--sip-put")
-            return SipPut(args[1], args[2]);
+        if (args.Length >= 3 && args[0] == "--sip-hash")
+            return SipHash(args[1], args[2]);
+
+        if (args.Length >= 3 && args[0] == "--sip-clear")
+            return SipClear(args[1], args[2]);
+        if (args.Length >= 4 && args[0] == "--sip-put")
+            return SipPut(args[1], args[2], args[3]);
 
         // ── Normal CLI entry point ──
         if (args.Length == 0 || args[0] is "--help" or "-h" or "help" or "/?")
@@ -52,7 +55,7 @@ Example:
         string? metadataPath = null;
         string algName = "sha256";
         string? timestampUrl = null;
-        int passes = 3;
+        int passes = 1;
         bool clearFirst = false, verbose = false;
 
         for (int i = 1; i < args.Length; i++)
@@ -78,6 +81,13 @@ Example:
         if (metadataPath is null)
         {
             Console.Error.WriteLine("Error: --metadata is required.");
+            return 1;
+        }
+
+        if (passes != 1)
+        {
+            Console.Error.WriteLine("Error: only --passes 1 is currently supported for legacy .dot VBA signatures.");
+            Console.Error.WriteLine("The agile/V3 signature formats require a different SIP-specific encoding.");
             return 1;
         }
 
@@ -167,7 +177,7 @@ Example:
                             string? timestampUrl)
     {
         // ── Step 1: Get IndirectData hash via self-subprocess ────────────
-        var fields = RunSipHashSubprocess(filePath, verbose);
+        var fields = RunSipHashSubprocess(filePath, digestAlgOid, verbose);
         if (fields == null) return false;
 
         if (verbose)
@@ -225,13 +235,20 @@ Example:
         byte[] pkcs7 = signedCms.Encode();
         if (verbose) Console.WriteLine($"   PKCS#7 size: {pkcs7.Length} bytes");
 
+        // Fail before touching the Office file if the CMS is not
+        // cryptographically self-consistent.
+        var verificationCms = new System.Security.Cryptography.Pkcs.SignedCms();
+        verificationCms.Decode(pkcs7);
+        verificationCms.CheckSignature(verifySignatureOnly: true);
+        if (verbose) Console.WriteLine("   CMS signature verified locally.");
+
         // ── Step 3: Embed signature via self-subprocess ─────────────────
         string pkcs7TempPath = Path.Combine(Path.GetTempPath(), $"test_vbasign_{Guid.NewGuid():N}.p7");
         File.WriteAllBytes(pkcs7TempPath, pkcs7);
         try
         {
             if (verbose) Console.WriteLine($"   Invoking PutSignedDataMsg via subprocess...");
-            bool putOk = RunSipPutSubprocess(filePath, pkcs7TempPath, verbose);
+            bool putOk = RunSipPutSubprocess(filePath, pkcs7TempPath, digestAlgOid, verbose);
             if (!putOk) return false;
             if (verbose) Console.WriteLine($"   Signature embedded successfully.");
         }
@@ -243,7 +260,7 @@ Example:
         return true;
     }
 
-    static void ClearSignatures(string filePath, IntPtr pGuid, IntPtr pAlgOid)
+    static int ClearSignatures(string filePath, IntPtr pGuid, IntPtr pAlgOid)
     {
         var si = new SIP_SUBJECTINFO();
         si.cbSize = 0x50;
@@ -254,18 +271,22 @@ Example:
         si.digestAlgObjId = pAlgOid;
         si.dwIntVersion = 1;
 
+        int removed = 0;
         try
         {
             for (int i = 0; i < 5; i++)
             {
                 if (!CryptSIPRemoveSignedDataMsg(ref si, 0))
                     break;
+                removed++;
             }
         }
         finally
         {
             Marshal.FreeHGlobal(si.pwsFileName);
         }
+
+        return removed;
     }
 
     /// <summary>
@@ -329,7 +350,7 @@ Example:
     /// <summary>
     /// Invokes self with --sip-hash to get IndirectData from a clean process.
     /// </summary>
-    static IndirectDataFields? RunSipHashSubprocess(string filePath, bool verbose)
+    static IndirectDataFields? RunSipHashSubprocess(string filePath, string digestAlgOid, bool verbose)
     {
         string self = Environment.ProcessPath
             ?? throw new InvalidOperationException("Cannot determine own executable path.");
@@ -337,7 +358,7 @@ Example:
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = self,
-            Arguments = $"--sip-hash \"{filePath}\"",
+            Arguments = $"--sip-hash \"{filePath}\" \"{digestAlgOid}\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -360,17 +381,18 @@ Example:
         // Parse structured output
         var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         string? dataOid = null, digestAlg = null;
-        byte[]? dataValue = null, digest = null;
+        byte[]? dataValue = null, digestAlgParams = null, digest = null;
         foreach (var line in lines)
         {
             var trimmed = line.Trim();
             if (trimmed.StartsWith("DATA_OID=")) dataOid = trimmed["DATA_OID=".Length..];
             else if (trimmed.StartsWith("DATA_VALUE=")) dataValue = Convert.FromHexString(trimmed["DATA_VALUE=".Length..]);
             else if (trimmed.StartsWith("DIGEST_ALG=")) digestAlg = trimmed["DIGEST_ALG=".Length..];
+            else if (trimmed.StartsWith("DIGEST_ALG_PARAMS=")) digestAlgParams = Convert.FromHexString(trimmed["DIGEST_ALG_PARAMS=".Length..]);
             else if (trimmed.StartsWith("DIGEST=")) digest = Convert.FromHexString(trimmed["DIGEST=".Length..]);
         }
 
-        if (dataOid == null || digestAlg == null || digest == null || dataValue == null)
+        if (dataOid == null || digestAlg == null || digestAlgParams == null || digest == null || dataValue == null)
         {
             Console.Error.WriteLine("   SIP hash subprocess returned incomplete data.");
             return null;
@@ -382,14 +404,14 @@ Example:
             DataValue = dataValue,
             DigestAlgOid = digestAlg,
             Digest = digest,
-            DigestAlgParams = [],
+            DigestAlgParams = digestAlgParams,
         };
     }
 
     /// <summary>
     /// Invokes self with --sip-put to embed the PKCS#7 in a clean process.
     /// </summary>
-    static bool RunSipPutSubprocess(string filePath, string pkcs7Path, bool verbose)
+    static bool RunSipPutSubprocess(string filePath, string pkcs7Path, string digestAlgOid, bool verbose)
     {
         string self = Environment.ProcessPath
             ?? throw new InvalidOperationException("Cannot determine own executable path.");
@@ -397,7 +419,7 @@ Example:
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = self,
-            Arguments = $"--sip-put \"{filePath}\" \"{pkcs7Path}\"",
+            Arguments = $"--sip-put \"{filePath}\" \"{pkcs7Path}\" \"{digestAlgOid}\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -434,7 +456,7 @@ Example:
     /// <summary>
     /// Subprocess mode: compute IndirectData and print fields to stdout.
     /// </summary>
-    static int SipHash(string filePath)
+    static int SipHash(string filePath, string digestAlgOid)
     {
         filePath = Path.GetFullPath(filePath);
         if (!File.Exists(filePath)) { Console.Error.WriteLine($"Not found: {filePath}"); return 1; }
@@ -442,7 +464,7 @@ Example:
         if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
         { Console.Error.WriteLine($"No SIP. Error: 0x{Marshal.GetLastWin32Error():X8}"); return 1; }
 
-        var si = BuildSubjectInfo(filePath, sipGuid, out var handles);
+        var si = BuildSubjectInfo(filePath, sipGuid, digestAlgOid, out var handles);
         try
         {
             uint cb = 0;
@@ -459,12 +481,16 @@ Example:
             string dataOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(pBuf, 0x00))!;
             uint dataValCb = (uint)Marshal.ReadInt32(pBuf, 0x04);
             IntPtr dataValPb = Marshal.ReadIntPtr(pBuf, 0x08);
-            string digestAlgOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(pBuf, 0x0C))!;
+            string sipDigestAlgOid = Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(pBuf, 0x0C))!;
+            uint digestAlgParamCb = (uint)Marshal.ReadInt32(pBuf, 0x10);
+            IntPtr digestAlgParamPb = Marshal.ReadIntPtr(pBuf, 0x14);
             uint digestCb = (uint)Marshal.ReadInt32(pBuf, 0x18);
             IntPtr digestPb = Marshal.ReadIntPtr(pBuf, 0x1C);
 
             byte[] dataVal = new byte[dataValCb];
             if (dataValCb > 0) Marshal.Copy(dataValPb, dataVal, 0, (int)dataValCb);
+            byte[] digestAlgParams = new byte[digestAlgParamCb];
+            if (digestAlgParamCb > 0) Marshal.Copy(digestAlgParamPb, digestAlgParams, 0, (int)digestAlgParamCb);
             byte[] digest = new byte[digestCb];
             if (digestCb > 0) Marshal.Copy(digestPb, digest, 0, (int)digestCb);
 
@@ -472,7 +498,8 @@ Example:
 
             Console.WriteLine($"DATA_OID={dataOid}");
             Console.WriteLine($"DATA_VALUE={Convert.ToHexString(dataVal)}");
-            Console.WriteLine($"DIGEST_ALG={digestAlgOid}");
+            Console.WriteLine($"DIGEST_ALG={sipDigestAlgOid}");
+            Console.WriteLine($"DIGEST_ALG_PARAMS={Convert.ToHexString(digestAlgParams)}");
             Console.WriteLine($"DIGEST={Convert.ToHexString(digest)}");
             Console.WriteLine($"SIZE={cb}");
             return 0;
@@ -480,10 +507,33 @@ Example:
         finally { FreeHandles(handles); }
     }
 
+    static int SipClear(string filePath, string digestAlgOid)
+    {
+        filePath = Path.GetFullPath(filePath);
+        if (!File.Exists(filePath)) { Console.Error.WriteLine($"Not found: {filePath}"); return 1; }
+
+        if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
+        { Console.Error.WriteLine($"No SIP. Error: 0x{Marshal.GetLastWin32Error():X8}"); return 1; }
+
+        GCHandle guidHandle = GCHandle.Alloc(sipGuid, GCHandleType.Pinned);
+        IntPtr algPtr = Marshal.StringToHGlobalAnsi(digestAlgOid);
+        try
+        {
+            int removed = ClearSignatures(filePath, guidHandle.AddrOfPinnedObject(), algPtr);
+            Console.WriteLine($"Removed={removed}");
+            return 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(algPtr);
+            guidHandle.Free();
+        }
+    }
+
     /// <summary>
     /// Subprocess mode: CreateIndirectData (to open file) then PutSignedDataMsg.
     /// </summary>
-    static int SipPut(string filePath, string pkcs7Path)
+    static int SipPut(string filePath, string pkcs7Path, string digestAlgOid)
     {
         filePath = Path.GetFullPath(filePath);
         pkcs7Path = Path.GetFullPath(pkcs7Path);
@@ -495,7 +545,7 @@ Example:
         if (!CryptSIPRetrieveSubjectGuid(filePath, IntPtr.Zero, out Guid sipGuid))
         { Console.Error.WriteLine($"No SIP. Error: 0x{Marshal.GetLastWin32Error():X8}"); return 1; }
 
-        var si = BuildSubjectInfo(filePath, sipGuid, out var handles);
+        var si = BuildSubjectInfo(filePath, sipGuid, digestAlgOid, out var handles);
         try
         {
             // CreateIndirectData to open the file and set SIP globals
@@ -526,7 +576,8 @@ Example:
         finally { FreeHandles(handles); }
     }
 
-    static SIP_SUBJECTINFO BuildSubjectInfo(string filePath, Guid sipGuid, out (GCHandle, IntPtr, IntPtr) handles)
+    static SIP_SUBJECTINFO BuildSubjectInfo(string filePath, Guid sipGuid, string digestAlgOid,
+                                            out (GCHandle, IntPtr, IntPtr) handles)
     {
         var si = new SIP_SUBJECTINFO();
         si.cbSize = 0x50;
@@ -536,7 +587,7 @@ Example:
         IntPtr pwsFile = Marshal.StringToHGlobalUni(filePath);
         si.pwsFileName = pwsFile;
         si.dwIntVersion = 1;
-        IntPtr pAlg = Marshal.StringToHGlobalAnsi(OID_SHA256);
+        IntPtr pAlg = Marshal.StringToHGlobalAnsi(digestAlgOid);
         si.digestAlgObjId = pAlg;
         si.dwEncodingType = ENCODING;
         handles = (guidPin, pwsFile, pAlg);

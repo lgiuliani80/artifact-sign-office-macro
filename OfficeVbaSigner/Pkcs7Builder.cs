@@ -51,8 +51,6 @@ internal static class Pkcs7Builder
         w.WriteObjectIdentifier(fields.DigestAlgOid);
         if (fields.DigestAlgParams.Length > 0)
             w.WriteEncodedValue(fields.DigestAlgParams);
-        else
-            w.WriteNull();
         w.PopSequence();
         // digest
         w.WriteOctetString(fields.Digest);
