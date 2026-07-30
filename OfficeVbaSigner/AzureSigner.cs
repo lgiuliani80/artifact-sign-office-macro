@@ -51,7 +51,6 @@ internal sealed class AzureSigner
         if (TryGetBool(root, "ExcludeAzurePowerShellCredential", out v)) opts.ExcludeAzurePowerShellCredential = v;
         if (TryGetBool(root, "ExcludeVisualStudioCredential", out v)) opts.ExcludeVisualStudioCredential = v;
         if (TryGetBool(root, "ExcludeVisualStudioCodeCredential", out v)) opts.ExcludeVisualStudioCodeCredential = v;
-        if (TryGetBool(root, "ExcludeSharedTokenCacheCredential", out v)) opts.ExcludeSharedTokenCacheCredential = v;
         if (TryGetBool(root, "ExcludeInteractiveBrowserCredential", out v)) opts.ExcludeInteractiveBrowserCredential = v;
         if (TryGetBool(root, "ExcludeAzureDeveloperCliCredential", out v)) opts.ExcludeAzureDeveloperCliCredential = v;
         if (TryGetBool(root, "ExcludeWorkloadIdentityCredential", out v)) opts.ExcludeWorkloadIdentityCredential = v;

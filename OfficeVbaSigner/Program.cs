@@ -84,13 +84,6 @@ Example:
             return 1;
         }
 
-        if (passes != 1)
-        {
-            Console.Error.WriteLine("Error: only --passes 1 is currently supported for legacy .dot VBA signatures.");
-            Console.Error.WriteLine("The agile/V3 signature formats require a different SIP-specific encoding.");
-            return 1;
-        }
-
         if (!File.Exists(filePath))    { Console.Error.WriteLine($"File not found: {filePath}"); return 1; }
         if (!File.Exists(metadataPath)){ Console.Error.WriteLine($"Metadata not found: {metadataPath}"); return 1; }
 
